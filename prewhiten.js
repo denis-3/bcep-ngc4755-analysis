@@ -1,17 +1,22 @@
 // analysis tool combining lomb scargle and least squares prewhitening
 
 const fs = require("fs")
-const { plot } = require("nodeplotlib");
+const { plot } = require("nodeplotlib")
+const { Worker } = require("worker_threads")
 
 // for the freq range the 1/T limit is 1/52.4905 for 2 secotrs
-// oversample by 5 means
 
-const DATA_FILE_NAME = "./tess-data/bw_cru_37_38.csv"
+const DATA_FILE_NAME = "./tess-data/cv_cru_64_65.csv"
 const PW_ITRS = 9999 // prewhiten itrs
 const FREQ_RANGE = [0.1, 10] // frequency range
 const LOMB_TRIES = 10_394 // Lomb-Scargle tries [this oversamples by 20]
 const SQUARES_TRIES = 10_000 // how many points to try for phase
 const NOISE_INT_WIDTH = 0.075 // width of the internal in which to find noise [days^-1]
+const WORKER_COUNT = 10
+
+if (WORKER_COUNT > require("os").cpus().length) {
+	console.warn("\n~~~\nWarning: Using more workers than CPU cores is not advised since there will be multiple workers in a core!\n~~~\n")
+}
 
 //
 // // Get The data
@@ -20,104 +25,124 @@ const NOISE_INT_WIDTH = 0.075 // width of the internal in which to find noise [d
 const parsedFiled = parseDataFile(DATA_FILE_NAME)
 const data = parsedFiled.data
 const DATA_Y_MEAN = parsedFiled.yMean
+const xDataBuf = new SharedArrayBuffer(Float64Array.BYTES_PER_ELEMENT * data[0].length)
+const yDataBuf = new SharedArrayBuffer(Float64Array.BYTES_PER_ELEMENT * data[0].length)
+const xData = new Float64Array(xDataBuf)
+const yData = new Float64Array(yDataBuf)
+
+for (var i = 0; i < data[0].length; i++) {
+	xData[i] = data[0][i]
+	yData[i] = data[1][i]
+}
+
+console.log("Creating workers...")
+const workers = []
+for (var i = 0; i < WORKER_COUNT; i++) {
+	const w = new Worker(__dirname + "/prewhiten-worker.js", { workerData: {x: xDataBuf, y: yDataBuf, freqRange: FREQ_RANGE, lombTries: LOMB_TRIES}})
+	const wi = i // worker index
+	w.on("error", (e) => {console.log("Worker", wi, "errored:", e)})
+	w.on("exit", (s) => {console.log("Worker", wi, "exited with status code:", s)})
+	workers.push(w)
+}
 
 // Lomb-Scargle Least-Squares prewhiten
-function lslsPrewhiten() {
-	const periodogramX = []
+async function lslsPrewhiten() {
+	var periodogramX = new Array(workers.length)
 	const periodogramYs = []
 	const tableRows = [] // {freqNum, snr, freq, amp}
-	var prevAmp = 0
-	var prevFreq = 0
 	for (var i = 0; i < PW_ITRS; i++) {
 		// lomb scargle first
-		var bestFreq = 0
-		var bestPower = 0
-		const periodogramY = []
+		var periodogramY = new Array(workers.length)
+		var workersDone = 0
+		console.log("Notifying workers for iteration", i, "...")
+		for (var ii = 0; ii < workers.length; ii++) {
+			workers[ii].removeAllListeners("message")
+			workers[ii].postMessage({command: "start periodogram",
+				startI: Math.floor(ii*LOMB_TRIES/workers.length),
+				endI: Math.ceil((ii+1)*LOMB_TRIES/workers.length),
+				iteration: i})
+			const wi = ii // worker index
+			workers[ii].on("message", (m) => {
+				if (m.message != "finished periodogram")
+				console.log()
+				if (m.x.length != 0) {
+					periodogramX[wi] = m.x
+				}
+				periodogramY[wi] = m.y
+				workersDone++
+			})
+		}
+
 		var nextLogTime = Date.now() + 2000
-		for (var ii = 1; ii < LOMB_TRIES; ii++) {
-			const thisFreq = FREQ_RANGE[0] + (FREQ_RANGE[1] - FREQ_RANGE[0]) * ii / LOMB_TRIES
-
-			const thisTau = lombScargleTau(thisFreq, data[0])
-			const thisCosPart = lombScargleCosPart(thisFreq, data[0], data[1], thisTau)
-			const thisSinPart = lombScargleSinPart(thisFreq, data[0], data[1], thisTau)
-			const thisLombScarglePower = (thisCosPart + thisSinPart) / 2
-
-			if (thisLombScarglePower > bestPower) {
-				bestFreq = thisFreq
-				bestPower = thisLombScarglePower
-			}
-
-			if (i == 0) periodogramX.push(thisFreq)
-			periodogramY.push(2 * Math.sqrt(thisLombScarglePower / data[0].length))
-
+		while (workersDone < workers.length) {
+			await millis(250)
 			if (Date.now() >= nextLogTime) {
-				console.log("Percent done with Lomb-Scargle", Math.round(100 * ii / LOMB_TRIES))
+				console.log("Workers done:", workersDone, "out of", workers.length)
 				nextLogTime += 2000
 			}
 		}
+		console.log("Workers finished!")
 
-		periodogramYs.push(periodogramY)
+		if (i == 0) periodogramX = periodogramX.flat()
+		periodogramY = periodogramY.flat()
 
-		// calculate SNR for the previous freq
-		if (i > 0) {
-			// code to do noise interal
-			// interval start i of the noise interval
-			// const intStartI = prevFreq > FREQ_RANGE[0] + NOISE_INT_WIDTH/2
-			// 	? (prevFreq - NOISE_INT_WIDTH/2 - FREQ_RANGE[0]) * LOMB_TRIES / (FREQ_RANGE[1] - FREQ_RANGE[0])
-			// 	: 0
-			// const intEndI = prevFreq < FREQ_RANGE[1] - NOISE_INT_WIDTH/2
-			// 	? (prevFreq + NOISE_INT_WIDTH/2 - FREQ_RANGE[0]) * LOMB_TRIES / (FREQ_RANGE[1] - FREQ_RANGE[0])
-			// 	: data[0].length
-			// const prevSnr = prevAmp / arrayStdev(periodogramY.slice(Math.floor(intStartI), Math.ceil(intEndI+1)), 0)
-			const prevSnr = prevAmp / arrayStdev(periodogramY, 0)
-			console.log("signal to noise ratio:", prevSnr)
-			if (prevSnr < 5.124) {
-				tableRows.pop()
-				break
-			} else {
-				tableRows[tableRows.length - 1].snr = roundToDecimal(prevSnr, 2)
+		var bestFreq = 0
+		var bestAmp = 0
+		for (var ii = 0; ii < periodogramX.length; ii++) {
+			if (periodogramY[ii] > bestAmp) {
+				bestFreq = periodogramX[ii]
+				bestAmp = periodogramY[ii]
 			}
 		}
 
-		if (i >= 3) periodogramYs.pop()
+		// significance check
+		const thisSnr = bestAmp / arrayMedian(periodogramY)
+		console.log("Signal to Noise Ratio:", thisSnr)
+		if (thisSnr <= 5.124) {
+			periodogramYs.push(periodogramY) // residual amplitude spectrum
+			break
+		}
 
-		const amp = 2 * Math.sqrt(bestPower / data[0].length)
-		console.log("best current freuqny", bestFreq, "power", bestPower)
+		if (i < 3) periodogramYs.push(periodogramY)
 
+		console.log("Finding phase...")
 		var bestPhase = 0
 		var bestRss = -1
 		// now least squares for phase
 		for (var iii = 0; iii < SQUARES_TRIES; iii++) {
-			const thisPct = iii / SQUARES_TRIES
-			const thisPhase = 2*Math.PI * thisPct
-			const thisRss = residualsSumOfSquares([amp, 2*Math.PI*bestFreq, thisPhase], data[0], data[1])
+			const thisPhase = 2*Math.PI * iii / SQUARES_TRIES
+			const thisRss = residualsSumOfSquares([bestAmp, 2*Math.PI*bestFreq, thisPhase], xData, yData)
 			if (thisRss < bestRss || bestRss == -1) {
 				bestRss = thisRss
 				bestPhase = thisPhase
 			}
 		}
-		const bestSineParams = [amp, 2*Math.PI*bestFreq, bestPhase]
-		console.log("final params, amp, freq, phase")
-		console.log(amp)
+		const bestSineParams = [bestAmp, 2*Math.PI*bestFreq, bestPhase]
+		console.log("Final amplitude, frequency, and phase")
+		console.log(bestAmp)
 		console.log(bestFreq)
 		console.log(bestPhase)
 
-		const thisRmsd = Math.sqrt(bestRss / data[0].length)
-		const ampUncrt = Math.sqrt(2 / data[0].length) * thisRmsd
+		const thisRmsd = Math.sqrt(bestRss / xData.length)
+		const ampUncrt = Math.sqrt(2 / xData.length) * thisRmsd
 		const phaseUncrt = ampUncrt / bestSineParams[0]
-		const freqUncrt = phaseUncrt * Math.sqrt(3) / (Math.PI * data[0][data[0].length-1])
+		const freqUncrt = phaseUncrt * Math.sqrt(3) / (Math.PI * (xData[xData.length-1] - xData[0]))
 
-		console.log("freq uncertainity", freqUncrt)
-
-		data[1] = data[1].map((y, ii) => y - getSinePrediction(bestSineParams, data[0][ii]))
+		for (var ii = 0; ii < yData.length; ii++) {
+			yData[ii] = yData[ii] - getSinePrediction(bestSineParams, xData[ii])
+		}
 
 		tableRows.push({
 			freqNum: i + 1,
+			freqDisplay: `${roundToDecimal(bestFreq, 5)} ± ${roundToDecimal(freqUncrt, 5)}`,
+			snr: roundToDecimal(thisSnr, 2),
+			ampDisplay: `${roundToDecimal(bestAmp, 1)} ± ${roundToDecimal(ampUncrt, 1)}`,
+			mmagAmp: roundToDecimal(1250 * Math.log10((DATA_Y_MEAN + bestAmp)/(DATA_Y_MEAN - bestAmp)), 2),
 			freq: roundToDecimal(bestFreq, 5),
-			amp: `${roundToDecimal(amp, 1)} ± ${roundToDecimal(ampUncrt, 1)}`,
-			mmagAmp: roundToDecimal(1250 * Math.log10((DATA_Y_MEAN + amp)/(DATA_Y_MEAN - amp)), 2)
+			amp: roundToDecimal(bestAmp, 1),
 		})
 
+		// for debug
 		if (i == 10000) {
 			const trace = {
 				x: periodogramX,
@@ -142,10 +167,13 @@ function lslsPrewhiten() {
 			})
 			break
 		}
-		prevAmp = amp
-		prevFreq = bestFreq
+		console.log("\n")
 	}
-	console.log("total of", tableRows.length, "frequencies")
+	console.log("Shutting down workers...")
+	workers.forEach(w => w.postMessage({command: "exit"}))
+
+
+	console.log("Total of", tableRows.length, "frequencies")
 	const layout = {
 		showlegend: false,
 		xaxis: {
@@ -219,10 +247,17 @@ function lslsPrewhiten() {
 	plot({
 		data: traces,
 		layout,
-		// config: {staticPlot: true}
 	})
 
-	console.table(tableRows, ["freqNum", "freq", "snr", "amp", "mmagAmp"])
+	console.table(tableRows, ["freqNum", "freqDisplay", "snr", "ampDisplay", "mmagAmp"])
+
+	const csvSave = "./freq-results/" + DATA_FILE_NAME.split("/").reverse()[0]
+	fs.writeFileSync(csvSave,
+		"DisplayFrequency,SNR,DisplayAmplitude,MmagAmplitude,Frequency,Amplitude" +
+		tableRows.map(r =>
+			`\n"f${r.freqNum}, ${r.freqDisplay}",${r.snr},${r.amp},${r.mmagAmp},${r.freq},${r.amp}`
+		))
+	console.log("Saved frequencies to", csvSave)
 }
 
 lslsPrewhiten()
@@ -241,6 +276,21 @@ function arrayStdev(arr, arrMean) {
 	if (arr.length == 0) throw Error("Zero-length array")
 	const squareSum = arr.reduce((a, c) => a + (c - arrMean) ** 2, 0)
 	return Math.sqrt(squareSum / arr.length)
+}
+
+function arrayMedian(values) {
+	const sorted = values
+		.slice()
+		.sort((a, b) => a - b);
+
+	const len = sorted.length;
+	const mid = Math.floor(len / 2);
+
+	if (len % 2 == 0) {
+		return (sorted[mid - 1] + sorted[mid]) / 2;
+	} else {
+		return sorted[mid];
+	}
 }
 
 function parseDataFile(fileName) {
@@ -271,45 +321,6 @@ function parseDataFile(fileName) {
 	return {data: thisData, yMean: dataYMean}
 }
 
-// the first fraction in lomb scargle
-function lombScargleCosPart(freq, timeStamps, fluxValues, tau) {
-	var numerator = 0
-	var denominator = 0
-	for (var i = 0; i < timeStamps.length; i++) {
-		const cosArgument = 2 * Math.PI * freq * (timeStamps[i] - tau)
-		numerator += fluxValues[i] * Math.cos(cosArgument)
-		denominator += (Math.cos(cosArgument) ** 2)
-	}
-	numerator = numerator ** 2
-	return numerator / denominator
-}
-
-// the second fraction in lomb scargle
-function lombScargleSinPart(freq, timeStamps, fluxValues, tau) {
-	var numerator = 0
-	var denominator = 0
-	for (var i = 0; i < timeStamps.length; i++) {
-		const sinArgument = 2 * Math.PI * freq * (timeStamps[i] - tau)
-		numerator += fluxValues[i] * Math.sin(sinArgument)
-		denominator += (Math.sin(sinArgument) ** 2)
-	}
-	numerator = numerator ** 2
-	return numerator / denominator
-}
-
-// tau function in lomb scargle
-function lombScargleTau(freq, timeStamps) {
-	var sinSum = 0
-	var cosSum = 0
-	for (var i = 0; i < timeStamps.length; i++) {
-		const sinCosArgument = 4 * Math.PI * freq * timeStamps[i]
-		sinSum += Math.sin(sinCosArgument)
-		cosSum += Math.cos(sinCosArgument)
-	}
-	const arctanResult = Math.atan2(sinSum, cosSum)
-	return arctanResult / (4 * Math.PI * freq)
-}
-
 function getSinePrediction(sineParams, x) {
 	return sineParams[0] * Math.sin(sineParams[1] * x + sineParams[2])
 }
@@ -327,4 +338,12 @@ function residualsSumOfSquares(sineParams, inputX, inputY) {
 
 function roundToDecimal(inp, dec) {
 	return Math.round(inp * (10**dec)) / (10**dec)
+}
+
+async function millis(m) {
+	return new Promise((resolve, reject) => {
+		setTimeout(() => {
+			resolve(true)
+		}, m)
+	})
 }

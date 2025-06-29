@@ -48,7 +48,7 @@ console.log("total points", starPoints.length)
 extinctionRmsd = Math.sqrt(extinctionRmsd[0] / extinctionRmsd[1])
 distModRmsd = Math.sqrt(distModRmsd[0] / distModRmsd[1])
 
-var metalsData = fs.readFileSync(METALS_FILE, "utf8").split("\n")
+var metalsData = fs.readFileSync("./cluster-data/cluster-metals.tsv", "utf8").split("\n")
 metalsData = metalsData.slice(metalsData.findIndex(e => e.startsWith("-"))+1).filter(e => e.includes(";")).map(e => e.split(";").map(v => Number(v)))
 
 const metalRms = Math.sqrt(metalsData.reduce((a, c) => a + c[4] ** 2, 0) / metalsData.length)
@@ -56,6 +56,18 @@ const metalRms = Math.sqrt(metalsData.reduce((a, c) => a + c[4] ** 2, 0) / metal
 console.log("E(B-V) uncertainty", extinctionRmsd)
 console.log("Distance modulus uncertainty", distModRmsd)
 console.log("Metals uncertainty", metalRms)
+
+process.exit(1)
+
+// testing things
+
+const testPoint = starPoints[177]
+
+console.log(controlPoints)
+
+console.log(testPoint)
+console.log("x reference", findResidualFromControls(testPoint, controlPoints, "x"))
+console.log("y reference", findResidualFromControls(testPoint, controlPoints, "y"))
 
 const isoTrace = {
 	x: controlPoints.map(c => c[0]),
