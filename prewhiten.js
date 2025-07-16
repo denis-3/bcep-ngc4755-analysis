@@ -4,10 +4,8 @@ const fs = require("fs")
 const { plot } = require("nodeplotlib")
 const { Worker } = require("worker_threads")
 
-// for the freq range the 1/T limit is 1/52.4905 for 2 secotrs
-
-const DATA_FILE_NAME = "./tess-data/cv_cru_64_65.csv"
-const PW_ITRS = 9999 // prewhiten itrs
+const DATA_FILE_NAME = "./tess-data/bw_cru_37_38.csv"
+const PW_ITRS = 9999 // prewhiten it
 const FREQ_RANGE = [0.1, 10] // frequency range
 const LOMB_TRIES = 10_394 // Lomb-Scargle tries [this oversamples by 20]
 const SQUARES_TRIES = 10_000 // how many points to try for phase
@@ -253,10 +251,10 @@ async function lslsPrewhiten() {
 
 	const csvSave = "./freq-results/" + DATA_FILE_NAME.split("/").reverse()[0]
 	fs.writeFileSync(csvSave,
-		"DisplayFrequency,SNR,DisplayAmplitude,MmagAmplitude,Frequency,Amplitude" +
+		"Frequency,SNR,Amplitude,MmagAmplitude" +
 		tableRows.map(r =>
-			`\n"f${r.freqNum}, ${r.freqDisplay}",${r.snr},${r.amp},${r.mmagAmp},${r.freq},${r.amp}`
-		))
+			`\n"f${r.freqNum}, ${r.freqDisplay}",${r.snr},${r.ampDisplay},${r.mmagAmp}`
+		).join(""))
 	console.log("Saved frequencies to", csvSave)
 }
 
